@@ -22,8 +22,20 @@
 @usableFromInline
 typealias NIOUnsafeContinuation<Success, Failure: Error> = CheckedContinuation<Success, Failure>
 
-#if compiler(>=6.1)
+#if compiler(>=6.2)
 @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
+@inlinable
+nonisolated(nonsending) func withNIOUnsafeThrowingContinuation<T>(
+    _ fn: (NIOUnsafeContinuation<T, any Error>) -> Void
+) async throws -> sending T {
+    try await withCheckedThrowingContinuation(fn)
+}
+#endif  // compiler 6.2
+
+@available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
+#if compiler(>=6.2)
+@available(*, deprecated, message: "Use the 'nonisolated(nonsending)' overload without an 'isolation' parameter.")
+#endif
 @inlinable
 func withNIOUnsafeThrowingContinuation<T>(
     isolation: isolated (any Actor)? = #isolation,
@@ -31,16 +43,6 @@ func withNIOUnsafeThrowingContinuation<T>(
 ) async throws -> sending T {
     try await withCheckedThrowingContinuation(isolation: isolation, fn)
 }
-#else
-@available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
-@inlinable
-func withNIOUnsafeThrowingContinuation<T: Sendable>(
-    isolation: isolated (any Actor)? = #isolation,
-    _ fn: (NIOUnsafeContinuation<T, any Error>) -> Void
-) async throws -> T {
-    try await withCheckedThrowingContinuation(isolation: isolation, fn)
-}
-#endif  // compiler 6.0
 #else
 /// A Swift Continuation that behaves like a `CheckedContinuation` in Debug mode
 /// and like a `UnsafeContinuation` in release mode.
@@ -51,8 +53,20 @@ func withNIOUnsafeThrowingContinuation<T: Sendable>(
 @usableFromInline
 typealias NIOUnsafeContinuation<Success, Failure: Error> = UnsafeContinuation<Success, Failure>
 
-#if compiler(>=6.1)
+#if compiler(>=6.2)
 @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
+@inlinable
+nonisolated(nonsending) func withNIOUnsafeThrowingContinuation<T>(
+    _ fn: (NIOUnsafeContinuation<T, any Error>) -> Void
+) async throws -> sending T {
+    try await withUnsafeThrowingContinuation(fn)
+}
+#endif  // compiler 6.2
+
+@available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
+#if compiler(>=6.2)
+@available(*, deprecated, message: "Use the 'nonisolated(nonsending)' overload without an 'isolation' parameter.")
+#endif
 @inlinable
 func withNIOUnsafeThrowingContinuation<T>(
     isolation: isolated (any Actor)? = #isolation,
@@ -60,16 +74,6 @@ func withNIOUnsafeThrowingContinuation<T>(
 ) async throws -> sending T {
     try await withUnsafeThrowingContinuation(isolation: isolation, fn)
 }
-#else
-@available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
-@inlinable
-func withNIOUnsafeThrowingContinuation<T: Sendable>(
-    isolation: isolated (any Actor)? = #isolation,
-    _ fn: (NIOUnsafeContinuation<T, any Error>) -> Void
-) async throws -> T {
-    try await withUnsafeThrowingContinuation(isolation: isolation, fn)
-}
-#endif  // compiler 6.0
 #endif  // release build
 
 extension EventLoopFuture {
@@ -79,6 +83,9 @@ extension EventLoopFuture {
     ///
     /// This function can be used to bridge an `EventLoopFuture` into the `async` world. Ie. if you're in an `async`
     /// function and want to get the result of this future.
+    ///
+    /// - seealso: ``getAbandoningOnCancel()`` which returns a `CancellationError` on cancellation (by abandoning this
+    ///     future) instead of ignoring cancellation altogether.
     @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
     @preconcurrency
     @inlinable
@@ -93,6 +100,33 @@ extension EventLoopFuture {
                 }
             }
         }.wrappedValue
+    }
+
+    /// Get the value/error from an `EventLoopFuture` in an `async` context, abandoning the future on cancellation.
+    ///
+    /// - warning: This method still violates Structured Concurrency: Cancelling the surrounding task does _not_
+    ///     cancel the operation that this future represents, it merely _abandons_ the future. In other words, the
+    ///     operation is likely still ongoing (holding on to its resources) and its result will be dropped. Unlike
+    ///     ``get()`` however, this method _will_ return promptly on cancellation, throwing `CancellationError`.
+    ///
+    /// This function can be used to bridge an `EventLoopFuture` into the `async` world. Ie. if you're in an `async`
+    /// function and want to get the result of this future.
+    ///
+    /// If cancellation and the completion of this future race, either the future's result or a `CancellationError`
+    /// may be returned.
+    ///
+    /// - seealso: ``get()`` which ignores cancellation entirely and therefore only returns once this future completes.
+    @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
+    @inlinable
+    public func getAbandoningOnCancel() async throws -> Value where Value: Sendable {
+        let promise = self.eventLoop.makePromise(of: Value.self)
+        self.cascade(to: promise)
+        return try await withTaskCancellationHandler {
+            try await promise.futureResult.get()
+        } onCancel: {
+            // If the future completes first, this is a no-op (first completion wins).
+            promise.fail(CancellationError())
+        }
     }
 }
 
@@ -133,6 +167,29 @@ extension EventLoopPromise {
     public func completeWithTask(
         _ body: @escaping @Sendable () async throws -> Value
     ) -> Task<Void, Never> where Value: Sendable {
+        Task {
+            do {
+                let value = try await body()
+                self.succeed(value)
+            } catch {
+                self.fail(error)
+            }
+        }
+    }
+
+    /// Complete a future with the result (or error) of the `async` function `body`.
+    ///
+    /// This function can be used to bridge the `async` world into an `EventLoopPromise`.
+    ///
+    /// - Parameters:
+    ///   - body: The `async` function to run.
+    /// - Returns: A `Task` which was created to `await` the `body`.
+    @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
+    @discardableResult
+    @inlinable
+    public func completeWithTaskSending(
+        _ body: sending @escaping () async throws -> sending Value
+    ) -> Task<Void, Never> {
         Task {
             do {
                 let value = try await body()
@@ -523,6 +580,11 @@ extension AsyncSequenceFromIterator: Sendable where AsyncIterator: Sendable {}
 
 @available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *)
 extension EventLoop {
+    /// Create a future that will be completed with the result of a Task.
+    /// This overload requires the task body result to be `Sendable`. If your return type is not sendable, consider using ``makeFutureWithTaskSending(_:)``.
+    /// - Parameter body: Async work to be run in a Task. The result of this function will be used to complete the future.
+    /// - Note: This Task is unstructured. It cannot be cancelled.
+    /// - Returns: A future which will be completed with the result of `body`
     @preconcurrency
     @inlinable
     public func makeFutureWithTask<Return: Sendable>(
@@ -530,6 +592,20 @@ extension EventLoop {
     ) -> EventLoopFuture<Return> {
         let promise = self.makePromise(of: Return.self)
         promise.completeWithTask(body)
+        return promise.futureResult
+    }
+
+    /// Create a future that will be completed with the result of a Task.
+    /// This overload requires the task body to return the result as `sending`, so the result does not need to be `Sendable`. If your return type is not disconnected, and is Sendable, consider using ``makeFutureWithTask(_:)``.
+    /// - Parameter body: Async work to be run in a Task. The result of this function will be used to complete the future.
+    /// - Note: This Task is unstructured. It cannot be cancelled.
+    /// - Returns: A future which will be completed with the result of `body`
+    @inlinable
+    public func makeFutureWithTaskSending<Return>(
+        _ body: sending @escaping () async throws -> sending Return
+    ) -> EventLoopFuture<Return> {
+        let promise = self.makePromise(of: Return.self)
+        promise.completeWithTaskSending(body)
         return promise.futureResult
     }
 }
